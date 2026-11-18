@@ -6,6 +6,7 @@
   GET  /versions                    版本历史
   GET  /versions/current            当前发布版本
   GET  /stops/{stop_id}/departures  查询站点未来一小时发车（合并跨午夜班次）
+  GET  /stops/{stop_id}/changes     站牌按站号+游标续领下一次已发布排班变更（新增/撤销/修改）
   GET  /docs                        在线 API 文档（Swagger UI，静态资源本地内置，离线可用）
 """
 from __future__ import annotations
@@ -19,16 +20,22 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from .changes import InvalidCursor, encode_cursor
 from .csv_import import parse_and_validate
 from .db import (
+    CursorAhead,
     Database,
     NoActiveVersion,
+    StopNeverExisted,
     StopNotFound,
     VersionNotFound,
     VersionNotPublishable,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# 设备首次续领的起始游标：尚未领取任何发布，基线为空（会领到首发版本的全部 added）
+INITIAL_CURSOR = encode_cursor(0)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -175,6 +182,51 @@ def create_app(db_path: str | None = None) -> FastAPI:
         except StopNotFound:
             raise HTTPException(
                 status_code=404, detail=f"当前发布版本中不存在站点 '{stop_id}'"
+            )
+
+    # ---------------- 站牌设备续领变更 ----------------
+
+    @app.get(
+        "/stops/{stop_id}/changes",
+        summary="站牌设备按站号与游标续领下一次已发布的排班变更",
+        description=(
+            "站牌离线后用本接口补领排班变化，避免继续显示已撤销的发车。\n\n"
+            f"- 首次续领不传 `cursor`，服务端使用起始游标 `{INITIAL_CURSOR}`（基线为空，"
+            "会领到首发版本中该站的全部新增发车）；\n"
+            "- 之后把上一次响应的 `next_cursor` 原样回传，逐次续领；\n"
+            "- 以 **(trip_id, stop_sequence)**（班次号 + 停站顺序）识别同一发车，"
+            "比较相邻两版该站的实际 UTC 发车与线路，给出 `added` / `cancelled` / `modified`；\n"
+            "- 新版删掉整座站时，旧站号仍可领到该站全部发车的 `cancelled`；\n"
+            "- 某次发布不涉及该站时，`changes` 为空但游标仍随发布前进；\n"
+            "- 游标无状态：同一游标重放得到完全相同的结果；\n"
+            "- 变更只随发布版生效，并发拉取不会读到未发布内容，也不会漏掉已发布变更。"
+        ),
+        responses={
+            400: {"description": "游标非法或指向尚未发生的发布"},
+            404: {"description": "该站号从未在任何已发布版本中出现"},
+            409: {"description": "尚无已发布版本"},
+        },
+    )
+    def stop_changes(
+        stop_id: str,
+        cursor: str | None = Query(
+            default=None,
+            description="上一次响应的 next_cursor；不传表示设备首次续领（起始游标）",
+        ),
+    ):
+        cur = cursor or INITIAL_CURSOR
+        try:
+            return db.get_stop_changes(stop_id, cur)
+        except InvalidCursor as exc:
+            raise HTTPException(status_code=400, detail=f"非法游标：{exc}")
+        except CursorAhead as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except NoActiveVersion:
+            raise HTTPException(status_code=409, detail="当前没有已发布的版本，无法续领")
+        except StopNeverExisted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"站号 '{stop_id}' 从未在任何已发布版本中出现，无法续领",
             )
 
     return app

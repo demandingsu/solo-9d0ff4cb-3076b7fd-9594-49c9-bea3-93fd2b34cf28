@@ -17,6 +17,7 @@ import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
+from .changes import DepartureRecord, decode_cursor, diff_departures, encode_cursor
 from .csv_import import ParsedData
 
 SCHEMA = """
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS versions (
     status TEXT NOT NULL CHECK (status IN ('staged', 'active', 'superseded', 'invalid')),
     created_at TEXT NOT NULL,
     published_at TEXT,
+    publish_seq INTEGER,
     stops_count INTEGER NOT NULL DEFAULT 0,
     trips_count INTEGER NOT NULL DEFAULT 0,
     stop_times_count INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +61,20 @@ CREATE TABLE IF NOT EXISTS stop_times (
 );
 CREATE INDEX IF NOT EXISTS idx_stop_times_stop ON stop_times (version_id, stop_id);
 CREATE INDEX IF NOT EXISTS idx_trips_date ON trips (version_id, service_date);
+-- 发布序号的唯一索引在迁移之后创建（旧库此时才补齐 publish_seq 列）
+"""
+
+# 旧库（升级前没有 publish_seq 列）迁移：按既有发布时间/版本号补齐稠密序号
+_MIGRATION_ADD_PUBLISH_SEQ = "ALTER TABLE versions ADD COLUMN publish_seq INTEGER"
+_MIGRATION_BACKFILL = """
+UPDATE versions
+SET publish_seq = (
+    SELECT COUNT(*) FROM versions v2
+    WHERE v2.status IN ('active', 'superseded')
+      AND (v2.published_at < versions.published_at
+           OR (v2.published_at = versions.published_at AND v2.id <= versions.id))
+)
+WHERE status IN ('active', 'superseded')
 """
 
 
@@ -70,12 +86,20 @@ class StopNotFound(Exception):
     """当前版本中不存在该站点。"""
 
 
+class StopNeverExisted(Exception):
+    """该站号从未在任何已发布版本中出现过。"""
+
+
 class VersionNotFound(Exception):
     """版本不存在。"""
 
 
 class VersionNotPublishable(Exception):
     """版本状态不允许发布。"""
+
+
+class CursorAhead(Exception):
+    """游标指向的发布序号晚于当前最新发布，设备拿了未来/伪造的游标。"""
 
 
 def _now_iso() -> str:
@@ -98,7 +122,20 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_publish_seq()
             self._conn.execute("INSERT OR IGNORE INTO meta (id, active_version_id) VALUES (1, NULL)")
+
+    def _migrate_publish_seq(self) -> None:
+        """旧库升级：补齐 publish_seq 列并按既有发布顺序回填稠密序号。"""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(versions)")}
+        if "publish_seq" not in cols:
+            self._conn.execute(_MIGRATION_ADD_PUBLISH_SEQ)
+            self._conn.execute(_MIGRATION_BACKFILL)
+        # 发布序号唯一且稠密：与自增 id 独立，防止"暂存编号与发布顺序相反"时混淆
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_publish_seq"
+            " ON versions (publish_seq) WHERE publish_seq IS NOT NULL"
+        )
 
     @contextmanager
     def _tx(self, immediate: bool = False):
@@ -149,9 +186,11 @@ class Database:
             return vid
 
     def publish(self, version_id: int) -> dict:
-        """整版发布：单事务内完成 旧版下线 + 新版上线 + 切换 active 指针。
+        """整版发布：单事务内完成 旧版下线 + 新版上线 + 分配发布序号 + 切换 active 指针。
 
-        中途任何失败都会回滚，meta 仍指向旧版本，旧版继续供数。
+        publish_seq 在同一事务内按发布顺序稠密分配（与自增版本号独立）：
+        暂存版编号可以与最终发布顺序相反，续领只认发布序号。
+        中途任何失败都会回滚，meta 仍指向旧版本，序号不产生空洞，旧版继续供数。
         """
         with self._tx(immediate=True) as conn:
             row = conn.execute("SELECT status FROM versions WHERE id = ?", (version_id,)).fetchone()
@@ -165,13 +204,22 @@ class Database:
             if status == "superseded":
                 raise VersionNotPublishable(f"版本 {version_id} 已被更新版本取代，不允许回滚发布")
             now = _now_iso()
+            next_seq = conn.execute(
+                "SELECT COALESCE(MAX(publish_seq), 0) + 1 FROM versions"
+            ).fetchone()[0]
             conn.execute("UPDATE versions SET status = 'superseded' WHERE status = 'active'")
             conn.execute(
-                "UPDATE versions SET status = 'active', published_at = ? WHERE id = ?",
-                (now, version_id),
+                "UPDATE versions SET status = 'active', published_at = ?, publish_seq = ?"
+                " WHERE id = ?",
+                (now, next_seq, version_id),
             )
             conn.execute("UPDATE meta SET active_version_id = ? WHERE id = 1", (version_id,))
-            return {"version_id": version_id, "status": "active", "published_at": now}
+            return {
+                "version_id": version_id,
+                "status": "active",
+                "published_at": now,
+                "publish_seq": next_seq,
+            }
 
     # ---------------- 读取 ----------------
 
@@ -248,6 +296,132 @@ class Database:
             "to": _iso_z(datetime.fromtimestamp(to_ts, timezone.utc)),
             "version_id": active,
             "departures": departures,
+        }
+
+    # ---------------- 站牌续领 ----------------
+
+    @staticmethod
+    def _day_ordinal(service_date: str) -> int:
+        d = date.fromisoformat(service_date)
+        return (d - date(1970, 1, 1)).days
+
+    def _fetch_departures(self, conn: sqlite3.Connection, version_id: int, stop_id: str):
+        """读取某已发布版本中某站点的全部实际发车（跨午夜分钟换算成实际 UTC）。"""
+        rows = conn.execute(
+            """SELECT st.trip_id AS trip_id, st.stop_sequence AS stop_sequence,
+                      tr.route_id AS route_id, tr.service_date AS service_date,
+                      st.departure_minutes AS departure_minutes
+               FROM stop_times st
+               JOIN trips tr ON tr.version_id = st.version_id AND tr.trip_id = st.trip_id
+               WHERE st.version_id = ? AND st.stop_id = ?""",
+            (version_id, stop_id),
+        ).fetchall()
+        records = []
+        for r in rows:
+            actual_minutes = self._day_ordinal(r["service_date"]) * 1440 + r["departure_minutes"]
+            records.append(
+                DepartureRecord(
+                    trip_id=r["trip_id"],
+                    stop_sequence=r["stop_sequence"],
+                    route_id=r["route_id"],
+                    service_date=r["service_date"],
+                    departure_minutes=r["departure_minutes"],
+                    actual_minutes=actual_minutes,
+                )
+            )
+        return records
+
+    def get_stop_changes(self, stop_id: str, cursor: str) -> dict:
+        """按站号与游标领取下一次（可含多次）已发布变更。
+
+        游标 = 设备已领取到的 publish_seq；无状态，同一游标重放结果一致。
+        整个过程在一个只读事务快照内完成：并发发布要么整体可见、要么整体不可见，
+        续领绝不会读到未发布内容，也不会漏掉已发布的变更。
+        """
+        seq = decode_cursor(cursor)  # 非法游标由 InvalidCursor 上抛 -> API 400
+
+        with self._tx() as conn:
+            active = conn.execute(
+                "SELECT active_version_id FROM meta WHERE id = 1"
+            ).fetchone()["active_version_id"]
+            if active is None:
+                raise NoActiveVersion
+
+            latest = conn.execute(
+                "SELECT MAX(publish_seq) AS m FROM versions WHERE publish_seq IS NOT NULL"
+            ).fetchone()["m"]
+            if seq > latest:
+                raise CursorAhead(
+                    f"游标指向发布序号 {seq}，但当前最新只发布到 {latest}"
+                )
+
+            # 该站号是否曾在任何"已发布"版本出现（暂存版不算，杜绝读到未发布内容）。
+            # 新版删掉整座站时，旧发布版里仍有该站 -> 不算 404，可继续领撤销。
+            ever = conn.execute(
+                "SELECT 1 FROM stops s JOIN versions v ON v.id = s.version_id"
+                " WHERE s.stop_id = ? AND v.publish_seq IS NOT NULL LIMIT 1",
+                (stop_id,),
+            ).fetchone()
+            if ever is None:
+                raise StopNeverExisted(stop_id)
+
+            # 游标之后的全部发布，按发布顺序；含本站无变更的发布（游标照样前进）
+            pubs = conn.execute(
+                """SELECT v.id AS version_id, v.publish_seq AS publish_seq,
+                          v.published_at AS published_at
+                   FROM versions v
+                   WHERE v.publish_seq > ?
+                   ORDER BY v.publish_seq ASC""",
+                (seq,),
+            ).fetchall()
+
+            # 游标指向的那一版（seq=0 表示"尚未领过任何发布"，基线为空）
+            prev_id = None
+            if seq > 0:
+                prev_row = conn.execute(
+                    "SELECT id FROM versions WHERE publish_seq = ?", (seq,)
+                ).fetchone()
+                prev_id = prev_row["id"]
+
+            # 站名：优先取最新版（可能已删站），否则沿发布链找最近一次出现的名字
+            name_row = conn.execute(
+                """SELECT s.stop_name AS stop_name FROM stops s
+                   JOIN versions v ON v.id = s.version_id
+                   WHERE s.stop_id = ? AND v.publish_seq IS NOT NULL
+                   ORDER BY v.publish_seq DESC LIMIT 1""",
+                (stop_id,),
+            ).fetchone()
+            stop_name = name_row["stop_name"] if name_row else None
+
+            old_records = (
+                self._fetch_departures(conn, prev_id, stop_id) if prev_id else []
+            )
+            batches: list[dict] = []
+            for pub in pubs:
+                new_records = self._fetch_departures(conn, pub["version_id"], stop_id)
+                changes = diff_departures(old_records, new_records)
+                batches.append(
+                    {
+                        "publish_seq": pub["publish_seq"],
+                        "version_id": pub["version_id"],
+                        "published_at": pub["published_at"],
+                        "change_count": len(changes),
+                        "changes": changes,
+                    }
+                )
+                old_records = new_records
+            latest_seq = latest
+            current_version_id = active
+
+        return {
+            "stop_id": stop_id,
+            "stop_name": stop_name,
+            "cursor": cursor,
+            "next_cursor": encode_cursor(latest_seq),
+            "caught_up": not batches,
+            "current_version_id": current_version_id,
+            "latest_publish_seq": latest_seq,
+            "publications": batches,
         }
 
     # ---------------- 工具 ----------------
